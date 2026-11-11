@@ -1,0 +1,4 @@
+interface:
+  display_name: "up-superverify"
+  short_description: "面向数字IC的产品验证、RTL修复与回归，交付精简报告和完整证据"
+  default_prompt: "使用 $up-superverify，根据需求和当前 RTL 制定验证计划，执行功能、协议、吞吐与延迟验证，修复缺陷并回归，交付正式报告及完整明细。"

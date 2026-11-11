@@ -1,0 +1,8 @@
+FICTIONAL DATA CONTRACT EXAMPLE — not measured RTL evidence.
+cp_a_selected PASS checks=1 actual=A=1
+cp_b_isolated PASS checks=1 actual=B=0
+cp_normal_a PASS checks=1 actual=A=0
+cp_normal_b PASS checks=1 actual=B=0
+coverage receiver_roles=100 percent condition=single event; select=A
+throughput events=1 events/cycle condition=single event; select=A
+SUMMARY PASS checks=4 errors=0 timeouts=0 exit_code=0

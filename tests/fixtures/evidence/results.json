@@ -1,0 +1,83 @@
+{
+  "schema_version": 1,
+  "runs": [
+    {
+      "id": "RUN-1",
+      "plan_sha256": "3954cf3a9711db74800f8da36579e84d5e4d2e0cee265baf4fe998e3b646da9d",
+      "inputs_sha256": "6f6d613059fd55f7fdcc21e5a570da29e328ab9b2755b394a73624c9c1b6a206",
+      "configuration_sha256": "a4a0ec2277dbe7c40df5131cb657e595a277b640c6a6e4049a7a922d2303a8b1",
+      "status": "PASS",
+      "checks": 4,
+      "errors": 0,
+      "timeouts": 0,
+      "tool": "fictional-example 1.0",
+      "command": "fictional-example --seed 7",
+      "seed": "7",
+      "started_at": "2026-11-10T12:00:00Z",
+      "ended_at": "2026-11-10T12:00:01Z",
+      "logs": [
+        {
+          "path": "logs/example.log",
+          "sha256": "c37b9e3c5da8431021b93dd5cc5b40982c7528d434ceb9064e6f44a012bf447e"
+        }
+      ],
+      "exit_code": 0
+    }
+  ],
+  "observations": [
+    {
+      "check_id": "CP-A",
+      "variant_id": "VAR-A",
+      "run_id": "RUN-1",
+      "status": "PASS",
+      "checks": 1,
+      "actual": "A=1"
+    },
+    {
+      "check_id": "CP-B",
+      "variant_id": "VAR-A",
+      "run_id": "RUN-1",
+      "status": "PASS",
+      "checks": 1,
+      "actual": "B=0"
+    },
+    {
+      "check_id": "CP-NORMAL-A",
+      "variant_id": "VAR-NORMAL",
+      "run_id": "RUN-1",
+      "status": "PASS",
+      "checks": 1,
+      "actual": "A=0"
+    },
+    {
+      "check_id": "CP-NORMAL-B",
+      "variant_id": "VAR-NORMAL",
+      "run_id": "RUN-1",
+      "status": "PASS",
+      "checks": 1,
+      "actual": "B=0"
+    }
+  ],
+  "coverage": [
+    {
+      "target_id": "COV-ROLES",
+      "run_id": "RUN-1",
+      "value": 100,
+      "unit": "percent",
+      "condition": "single event; select=A"
+    }
+  ],
+  "measurements": [
+    {
+      "target_id": "MET-RATE",
+      "run_id": "RUN-1",
+      "value": 1,
+      "unit": "events/cycle",
+      "condition": "single event; select=A"
+    }
+  ],
+  "summary": "This untrusted summary is deliberately ignored.",
+  "current_runs": [
+    "RUN-1"
+  ]
+}

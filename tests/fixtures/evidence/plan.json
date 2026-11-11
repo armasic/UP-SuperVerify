@@ -1,0 +1,155 @@
+{
+  "schema_version": 1,
+  "project": "双接收者示例",
+  "inputs": {
+    "roots": [
+      "inputs"
+    ],
+    "files": [
+      {
+        "path": "inputs/checks.sv",
+        "sha256": "d1de8ab5e9b266dbd5016528e4660719366e2f82edfd0158d096291ffd4022cd"
+      },
+      {
+        "path": "inputs/design.sv",
+        "sha256": "4eec3c965f485200a16f4ae7cdb2a40e1d44850fe4e555ac2ffe36f34dc3bed7"
+      }
+    ]
+  },
+  "configuration": {
+    "clock_mhz": 100,
+    "selection": "A"
+  },
+  "requirements": [
+    {
+      "id": "REQ-ROUTE",
+      "description": "事件仅影响选中的接收者",
+      "source": "虚构规范 第1节",
+      "required": true
+    }
+  ],
+  "cases": [
+    {
+      "id": "CASE-ROUTE",
+      "description": "地址选择与隔离",
+      "requirements": [
+        "REQ-ROUTE"
+      ],
+      "isolation": {
+        "selected": [
+          "A"
+        ],
+        "unselected": [
+          "B"
+        ]
+      },
+      "high_risk": {
+        "activation": "A定址事件；B预置为零",
+        "discriminating_checks": [
+          "CP-B"
+        ],
+        "normal_controls": [
+          "VAR-NORMAL"
+        ],
+        "activation_checks": [
+          "CP-A"
+        ]
+      },
+      "variants": [
+        {
+          "id": "VAR-A",
+          "parameters": {
+            "receiver": "A",
+            "event": 1
+          },
+          "preconditions": "A=0; B=0",
+          "stimulus": "select=A; event=1，推进一个时钟",
+          "observe_at": "事件采样后一个时钟",
+          "checks": [
+            {
+              "id": "CP-A",
+              "description": "选中对象接收事件",
+              "expected": "A=1",
+              "oracle": "Fictional controller specification section 1",
+              "implementation": "inputs/checks.sv#cp_a_selected",
+              "receiver": "A",
+              "role": "selected",
+              "requirements": [
+                "REQ-ROUTE"
+              ]
+            },
+            {
+              "id": "CP-B",
+              "description": "非选中对象保持",
+              "expected": "B=0",
+              "oracle": "Fictional controller specification section 1",
+              "implementation": "inputs/checks.sv#cp_b_isolated",
+              "receiver": "B",
+              "role": "unselected",
+              "requirements": [
+                "REQ-ROUTE"
+              ]
+            }
+          ]
+        },
+        {
+          "id": "VAR-NORMAL",
+          "parameters": {
+            "receiver": "A",
+            "event": 0
+          },
+          "preconditions": "A=0; B=0",
+          "stimulus": "select=A; event=0，推进一个时钟",
+          "observe_at": "空闲采样后一个时钟",
+          "checks": [
+            {
+              "id": "CP-NORMAL-A",
+              "description": "无事件时A保持",
+              "expected": "A=0",
+              "oracle": "Fictional controller specification section 1",
+              "implementation": "inputs/checks.sv#cp_normal_a",
+              "receiver": "A",
+              "role": "selected",
+              "requirements": [
+                "REQ-ROUTE"
+              ]
+            },
+            {
+              "id": "CP-NORMAL-B",
+              "description": "无事件时B保持",
+              "expected": "B=0",
+              "oracle": "Fictional controller specification section 1",
+              "implementation": "inputs/checks.sv#cp_normal_b",
+              "receiver": "B",
+              "role": "unselected",
+              "requirements": [
+                "REQ-ROUTE"
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "coverage_targets": [
+    {
+      "id": "COV-ROLES",
+      "description": "选中及非选中角色",
+      "unit": "percent",
+      "condition": "single event; select=A",
+      "op": ">=",
+      "target": 100
+    }
+  ],
+  "metrics": [
+    {
+      "id": "MET-RATE",
+      "kind": "throughput",
+      "description": "事件接收速率",
+      "unit": "events/cycle",
+      "condition": "single event; select=A",
+      "op": ">=",
+      "target": 1
+    }
+  ]
+}
