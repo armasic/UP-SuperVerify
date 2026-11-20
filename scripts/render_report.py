@@ -8,15 +8,17 @@ import json
 import os
 from pathlib import Path
 import re
+from struct import error as StructError
 import sys
 import tempfile
+from urllib.parse import quote
 
 from check_evidence import BOUNDARY, EXIT_CODES, evaluate, load_inputs
 
 DETAIL_FIELDS = ("requirement_ids", "requirement_sources", "case_id", "case_description", "variant_id", "parameters", "preconditions",
                  "stimulus", "observe_at", "check_id", "check_description", "expected", "oracle", "implementation",
                  "receiver", "role", "risk_activation", "activation_checks", "discriminating_checks", "normal_controls", "status", "actual",
-                 "check_count", "run_id", "run_metadata", "log_paths")
+                 "check_count", "run_id", "run_metadata", "log_paths", "waveform")
 
 
 def public_text(value, root=None):
@@ -63,6 +65,7 @@ def detail_rows(plan, results):
                     run = runs.get(obs["run_id"], {})
                     row["run_metadata"] = run
                     row["log_paths"] = ";".join(record["path"] for record in run.get("logs", []))
+                    row["waveform"] = obs.get("waveform", "")
                     yield row
 
 
@@ -73,6 +76,21 @@ def report_sections(plan, results, outcome, details_name):
                          "必验需求 {required_requirements} 项；排除需求 {excluded_requirements} 项；有效通过检查点 {passed_checks}/{planned_checks} 个；当前运行 {current_runs} 次。".format(**summary)], [])]
     if outcome["blockers"]:
         sections.append(("验收缺口", outcome["blockers"], []))
+    module = plan.get("module_report", {})
+    oracles = list(dict.fromkeys(cp["oracle"] for case in plan["cases"] for variant in case["variants"] for cp in variant["checks"]))
+    strategy = [module.get("strategy", "逐条核对需求来源、适用条件和独立预期，再按变体采样。")]
+    if oracles:
+        strategy.append("判据来源包括 " + "、".join(oracles) + "。")
+    if module:
+        strategy.append("计划保留关键检查 " + "、".join(module["waveform_checks"]) + " 的波形。")
+    sections.append(("验证策略", strategy, []))
+    variants = []
+    for case in plan["cases"]:
+        for variant in case["variants"]:
+            checks = "；".join(cp["id"] + " " + (cp["expected"] or "待明确") for cp in variant["checks"])
+            event = "前提 " + variant["preconditions"] + "。刺激 " + variant["stimulus"] + "。采样 " + variant["observe_at"]
+            variants.append((case["id"] + " / " + variant["id"] + " " + ", ".join(case["requirements"]), event, checks))
+    sections.append(("验证方案", [], [(("用例 / 变体 / 需求", "前提、刺激与采样", "检查点与预期"), variants)]))
     environment = [("配置", public_text(plan["configuration"]))]
     current = [run for run in results["runs"] if run["id"] in results["current_runs"]]
     if current:
@@ -83,14 +101,16 @@ def report_sections(plan, results, outcome, details_name):
             ("工具版本", "; ".join(dict.fromkeys(run["tool"] for run in current))),
             ("基线", "plan " + first["plan_sha256"][:12] + "；inputs " + first["inputs_sha256"][:12] + "；config " + first["configuration_sha256"][:12]),
             ("运行范围", str(len(current)) + " 次；" + min(starts).astimezone(timezone.utc).isoformat() + " 至 " + max(ends).astimezone(timezone.utc).isoformat())])
-    sections.append(("环境配置", ["逐次命令、种子、完整身份与日志索引见明细附件。"], [(('项目', '记录'), environment)]))
     rows = []
     for req in plan["requirements"]:
         checks = [cp for case in plan["cases"] for variant in case["variants"] for cp in variant["checks"] if req["id"] in cp["requirements"]]
         passed = sum(cp["id"] in summary["passed_check_ids"] for cp in checks)
         state = "已授权排除" if not req["required"] else str(passed) + "/" + str(len(checks)) + " CP PASS"
         rows.append((req["id"], req["description"], state))
-    sections.append(("功能与协议", [], [(('需求', '内容', '检查结果'), rows)]))
+    sections.append(("验证结果", [], [(('需求', '内容', '检查结果'), rows)]))
+    if module or any("waveform" in obs for obs in results["observations"]):
+        sections.append(("实测波形", [], []))
+    sections.append(("环境配置", ["逐次命令、种子、完整身份与日志索引见明细附件。"], [(('项目', '记录'), environment)]))
     targets = []
     for target_field, result_field in (("coverage_targets", "coverage"), ("metrics", "measurements")):
         for target in plan[target_field]:
@@ -123,12 +143,34 @@ def report_sections(plan, results, outcome, details_name):
     return sections
 
 
-def markdown_text(title, sections, root):
+def current_figures(plan, results, root):
+    """Use evaluated observations and the exact per-run capture, including failing checks."""
+    if root is None:
+        return []
+    figures = []
+    for row in detail_rows(plan, results):
+        wave = row["waveform"]
+        if not wave or not row["check_count"] or row["status"] not in {"PASS", "FAIL"}:
+            continue
+        caption = (f"{row['case_id']} / {row['variant_id']} / {row['check_id']}（{row['requirement_ids']}），运行 {row['run_id']}。"
+                   f"信号 {', '.join(wave['signals'])}，窗口 {wave['window']}。刺激 {row['stimulus']}。采样 {row['observe_at']}。"
+                   f"预期 {row['expected']}，实测 {row['actual']}（{row['status']}）。原始波形 {wave['trace']}")
+        figures.append((Path(root) / wave["image"], caption))
+    return figures
+
+
+def markdown_text(title, sections, root, figures=(), output_dir=None):
     def cell(value):
         return public_text(value, root).replace("|", "\\|").replace("\n", "<br>")
     lines = ["# " + public_text(title, root), ""]
     for heading, paragraphs, tables in sections:
-        lines += ["## " + heading, ""]
+        lines += [("#" * (heading_level(heading) + 1)) + " " + heading, ""]
+        if heading == "实测波形":
+            if not figures:
+                lines += ["本次没有可核对的实测波形图。", ""]
+            for path, caption in figures:
+                url = quote(os.path.relpath(path, output_dir), safe="/")
+                lines += [f"![实测波形]({url})", "", public_text(caption, root), ""]
         for paragraph in paragraphs:
             lines += [public_text(paragraph, root), ""]
         for headers, rows in tables:
@@ -138,12 +180,17 @@ def markdown_text(title, sections, root):
     return "\n".join(lines)
 
 
-def word_bytes(title, sections, root):
+def heading_level(name):
+    return 1 if name in {"结论", "验证策略", "验证方案", "验证结果"} else 2
+
+
+def word_bytes(title, sections, root, figures=()):
     try:
         from docx import Document
         from docx.oxml import OxmlElement
         from docx.oxml.ns import qn
         from docx.enum.table import WD_CELL_VERTICAL_ALIGNMENT
+        from docx.image.exceptions import InvalidImageStreamError, UnrecognizedImageError, UnexpectedEndOfFileError
         from docx.shared import Inches, Pt, RGBColor
     except ImportError:
         raise ValueError("Word export requires optional python-docx; no package was installed. Use .md or provide an environment with python-docx.") from None
@@ -175,7 +222,21 @@ def word_bytes(title, sections, root):
     doc.core_properties.title = public_text(title, root)
     doc.add_paragraph(public_text(title, root), "Title")
     for heading, paragraphs, tables in sections:
-        doc.add_heading(heading, 1)
+        doc.add_heading(heading, heading_level(heading))
+        if heading == "实测波形":
+            if not figures:
+                doc.add_paragraph("本次没有可核对的实测波形图。")
+            for path, caption in figures:
+                figure = doc.add_paragraph()
+                figure.paragraph_format.keep_with_next = True
+                try:
+                    shape = figure.add_run().add_picture(str(path), width=Inches(6.5))
+                except (InvalidImageStreamError, UnrecognizedImageError, UnexpectedEndOfFileError, ValueError, StructError, ZeroDivisionError):
+                    raise ValueError("unreadable waveform PNG: " + path.name) from None
+                if shape.height > Inches(5):
+                    shape.width = int(shape.width * Inches(5) / shape.height)
+                    shape.height = Inches(5)
+                doc.add_paragraph(public_text(caption, root))
         for paragraph in paragraphs:
             doc.add_paragraph(public_text(paragraph, root))
         for headers, rows in tables:
@@ -242,20 +303,26 @@ def main(argv=None):
     parser.add_argument("--results", required=True, help="results JSON, relative to --root")
     parser.add_argument("--root", help="current project root; omission prevents ACCEPTED")
     parser.add_argument("--output", required=True, help="report path ending .md or .docx (relative to current directory)")
-    parser.add_argument("--details", help="CSV attachment path; default OUTPUT-STEM-details.csv")
+    parser.add_argument("--details", help="CSV attachment path; module exports keep the project version at the end")
     args = parser.parse_args(argv)
     try:
         output = Path(args.output)
-        details = Path(args.details) if args.details else output.with_name(output.stem + "-details.csv")
-        if output.suffix.lower() not in {".md", ".docx"} or details.suffix.lower() != ".csv":
+        if output.suffix.lower() not in {".md", ".docx"} or (args.details and Path(args.details).suffix.lower() != ".csv"):
             raise ValueError("output must be .md or .docx and details must be .csv")
-        if output.resolve() == details.resolve():
-            raise ValueError("report and details must have different output paths")
         plan, results = load_inputs(args.plan, args.results, args.root)
         outcome = evaluate(plan, results, args.root)
         if outcome["status"] == "INVALID":
             print(json.dumps(outcome, ensure_ascii=False, indent=2), file=sys.stderr)
             return 1
+        version = plan.get("module_report", {}).get("version")
+        if version and not output.stem.endswith("_" + version):
+            raise ValueError("report filename must end in _" + version + output.suffix)
+        detail_stem = output.stem + "-details"
+        if version:
+            detail_stem = output.stem.removesuffix("_" + version) + "-details_" + version
+        details = Path(args.details) if args.details else output.with_name(detail_stem + ".csv")
+        if output.resolve() == details.resolve():
+            raise ValueError("report and details must have different output paths")
         root = Path(args.root).resolve() if args.root else None
         input_paths = [(root / p).resolve() if root else Path(p).resolve() for p in (args.plan, args.results)]
         # With no verified root, use the plan directory only as a conservative write guard.
@@ -267,10 +334,14 @@ def main(argv=None):
         for candidate in (output.resolve(), details.resolve()):
             if candidate in protected_files or any(candidate == p or p in candidate.parents for p in protected):
                 raise ValueError("output must not replace inputs or evidence")
-        title = plan["project"] + " 验证报告"
-        sections = report_sections(plan, results, outcome, details.name)
+        title = plan["project"] + " 验证报告" + (" " + version if version else "")
+        sections = report_sections(plan, results, outcome, os.path.relpath(details.resolve(), output.resolve().parent))
+        figures = current_figures(plan, results, root)
         # Finish generation in memory before touching outputs, including dependency checks.
-        body = markdown_text(title, sections, args.root).encode("utf-8") if output.suffix.lower() == ".md" else word_bytes(title, sections, args.root)
+        if output.suffix.lower() == ".md":
+            body = markdown_text(title, sections, args.root, figures, output.resolve().parent).encode("utf-8")
+        else:
+            body = word_bytes(title, sections, args.root, figures)
         stream = io.StringIO(newline="")
         writer = csv.DictWriter(stream, fieldnames=DETAIL_FIELDS)
         writer.writeheader()

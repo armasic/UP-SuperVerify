@@ -8,11 +8,13 @@ import math
 from pathlib import Path, PurePosixPath
 import re
 import sys
+from zlib import crc32
 
 STATUSES = ("PASS", "FAIL", "BLOCKED", "SKIP", "NOT_RUN", "ERROR", "TIMEOUT")
 EXIT_CODES = {"ACCEPTED": 0, "INCOMPLETE": 2, "INVALID": 1, "PLAN_VALID": 0}
 BOUNDARY = "自动检查仅核对声明范围、结构和文件身份；需求完整性、判据独立性及正确性、排除授权真实性仍须语义审阅。"
 UNKNOWN = {"", "UNKNOWN", "TBD", "TODO", "UNDEFINED", "待确认", "未知"}
+MODULE_VERSION = r"[vV][0-9]+(?:[.p][0-9]+)*"
 
 
 def load_json(path):
@@ -153,7 +155,7 @@ def _file_records(v, records, where, nonempty=True):
 def validate_plan(plan):
     """Return structural errors. Missing execution/unknown expectations are blockers, not syntax errors."""
     v = Validation()
-    plan = v.obj(plan, "plan", ("schema_version", "project", "inputs", "configuration", "requirements", "cases", "coverage_targets", "metrics"))
+    plan = v.obj(plan, "plan", ("schema_version", "project", "inputs", "configuration", "requirements", "cases", "coverage_targets", "metrics"), ("module_report",))
     if type(plan.get("schema_version")) is not int or plan.get("schema_version") != 1:
         v.error("plan", "unsupported schema_version")
     v.text(plan.get("project"), "plan.project")
@@ -187,6 +189,7 @@ def validate_plan(plan):
                 v.text(exclusion.get(field), "exclusion." + field)
         elif "exclusion" in req:
             v.error("requirement", "exclusion requires required=false")
+    check_ids = set()
     for case in v.array(plan.get("cases"), "cases"):
         case = v.obj(case, "case", ("id", "description", "requirements", "variants"), ("isolation", "high_risk"))
         v.identifier(case.get("id"), "case.id")
@@ -224,6 +227,7 @@ def validate_plan(plan):
                     elif implementation.split("#", 1)[0] not in paths:
                         v.error("check.implementation", "file absent from input manifest")
                 if isinstance(cp.get("id"), str):
+                    check_ids.add(cp["id"])
                     checks[cp["id"]] = vid if isinstance(vid, str) else None
                 if "receiver" in cp or "role" in cp:
                     v.text(cp.get("receiver"), "check.receiver")
@@ -256,6 +260,14 @@ def validate_plan(plan):
             for vid in variants:
                 if not needed.issubset(roles[vid]):
                     v.error("isolation", "variant " + vid + " lacks independent selected/unselected checks")
+    if "module_report" in plan:
+        report = v.obj(plan["module_report"], "module_report", ("version", "strategy", "waveform_checks"))
+        if not isinstance(report.get("version"), str) or not re.fullmatch(MODULE_VERSION, report["version"]):
+            v.error("module_report.version", "expected the project version, e.g. v0p1 for a new project")
+        v.text(report.get("strategy"), "module_report.strategy")
+        for ref in v.strings(report.get("waveform_checks"), "module_report.waveform_checks", True):
+            if ref not in check_ids:
+                v.error("module_report.waveform_checks", "unknown check " + ref)
     for field in ("coverage_targets", "metrics"):
         for target in v.array(plan.get(field), field):
             required = ("id", "description", "unit", "condition", "op", "target")
@@ -336,6 +348,70 @@ def _verify_files(plan, runs, root, errors):
             errors.append(str(exc) if isinstance(exc, ValueError) else "cannot read evidence file: " + record["path"])
 
 
+def _png_capture(path):
+    """Check chunk boundaries and CRCs without loading a large screenshot into memory."""
+    if not path.is_file():
+        return False
+    with path.open("rb") as stream:
+        if stream.read(8) != b"\x89PNG\r\n\x1a\n":
+            return False
+        first = True
+        has_pixels = False
+        while True:
+            header = stream.read(8)
+            if len(header) != 8:
+                return False
+            remaining, tag = int.from_bytes(header[:4], "big"), header[4:]
+            if first and (tag != b"IHDR" or remaining != 13):
+                return False
+            first = False
+            if tag == b"IEND" and remaining:
+                return False
+            if tag == b"IDAT" and remaining:
+                has_pixels = True
+            checksum = crc32(tag)
+            while remaining:
+                block = stream.read(min(remaining, 65536))
+                if not block:
+                    return False
+                checksum = crc32(block, checksum)
+                remaining -= len(block)
+            if stream.read(4) != checksum.to_bytes(4, "big"):
+                return False
+            if tag == b"IEND":
+                return has_pixels and not stream.read(1)
+
+
+def _waveform_checks(observations, runs, root, v):
+    """Each capture belongs to the same current run and observation as the checked value."""
+    captured = set()
+    for obs in observations:
+        if "waveform" not in obs:
+            continue
+        where = "waveform " + obs["check_id"] + "/" + obs["run_id"]
+        wave = v.obj(obs["waveform"], where, ("trace", "image", "signals", "window"))
+        v.strings(wave.get("signals"), where + ".signals", True)
+        v.text(wave.get("window"), where + ".window")
+        logs = {item["path"] for item in runs[obs["run_id"]]["logs"]}
+        trace, image = wave.get("trace"), wave.get("image")
+        if not safe_relative(trace) or trace not in logs:
+            v.error(where, "raw trace must occur in this run's hashed logs")
+        elif not re.search(r"\.(?:e?vcd|fst|fsdb|vpd|wlf|wdb|ghw|trn|lxt2?|asdb)(?:\.(?:gz|bz2|zst))?\Z", trace, re.I):
+            v.error(where, "expected a waveform database or VCD export")
+        if not safe_relative(image) or image not in logs or not image.lower().endswith(".png") or image == trace:
+            v.error(where, "PNG capture must occur in this run's hashed logs")
+        elif root is not None:
+            try:
+                path = resolve_inside(Path(root).resolve(strict=True), image)
+                if not _png_capture(path):
+                    raise ValueError()
+            except (ValueError, OSError, RuntimeError):
+                v.error(where, "could not read PNG capture: " + image)
+        if obs["checks"] > 0 and obs["status"] in {"PASS", "FAIL"}:
+            captured.add(obs["check_id"])
+    return captured
+
+
 def evaluate(plan, results, root=None):
     """Evaluate only explicitly current runs against this plan and current input files."""
     errors = validate_plan(plan)
@@ -390,7 +466,7 @@ def evaluate(plan, results, root=None):
     observations = v.array(results.get("observations"), "observations")
     pairs = set()
     for observation in observations:
-        obs = v.obj(observation, "observation", ("check_id", "variant_id", "run_id", "status", "checks", "actual"))
+        obs = v.obj(observation, "observation", ("check_id", "variant_id", "run_id", "status", "checks", "actual"), ("waveform",))
         for key in ("check_id", "variant_id", "run_id"):
             v.text(obs.get(key), "observation." + key)
         cid, rid = obs.get("check_id"), obs.get("run_id")
@@ -454,6 +530,12 @@ def evaluate(plan, results, root=None):
         v.strings(results["limitations"], "results.limitations")
     if v.errors:
         return _outcome(v.errors, blockers, summary)
+    captured = _waveform_checks(observations, runs, root, v)
+    if v.errors:
+        return _outcome(v.errors, blockers, summary)
+    required_captures = set(plan.get("module_report", {}).get("waveform_checks", []))
+    for cid in sorted(required_captures - captured):
+        blockers.append("missing current waveform for check: " + cid)
     summary["current_runs"] = len(current)
     if not current:
         blockers.append("no current runs selected")

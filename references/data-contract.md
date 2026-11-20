@@ -30,6 +30,24 @@ API：`load_json(path)` 严格读 JSON；`validate_plan(plan) -> list[str]` 返�
 
 顶层必需字段：`schema_version`、`project`、`inputs`、`configuration`、`requirements`、`cases`、`coverage_targets`、`metrics`。
 
+### 正式模块报告
+
+单模块正式交付在运行前增加可选对象 `module_report`。既有独立验证计划可继续使用原格式。示例中的 `CP-COMMIT` 须替换为本计划已有的检查点 ID。
+
+```json
+{"module_report":{"version":"v0p1","strategy":"逐项检查接受与提交边沿，以输入有效信号提前撤销区分早交和漏交。","waveform_checks":["CP-COMMIT"]}}
+```
+
+`version` 填本次交付的版本号。没有既定写法的新项目默认从 `v0p1` 开始。若仅指定版本数字，例如 0.2，填写 `v0p2`。接收设计交接或项目已指定写法时沿用其原样，如 `V0.5`。输出文件名须以 `_<version>.docx` 或 `_<version>.md` 收尾。策略按本模块填写。`waveform_checks` 列出至少一个需要实测波形的关键 CP，可包括失败样本和修复后的边界。字段参与计划身份计算，计划变更后按新计划采证。
+
+在对应的当前运行 observation 内加入 `waveform`。复用本条 CP 的 case、variant、预期和实际结果。对象包括同一 run 的原始波形文件、可嵌入的 PNG、信号名列表和采样时间窗口。
+
+```json
+{"waveform":{"trace":"runs/r7/commit.vcd","image":"runs/r7/commit.png","signals":["clk","valid","enable","commit"],"window":"N 至 N+2，120–140 ns"}}
+```
+
+两份文件都须登记在该次运行的 `logs` 中，使用各自的 SHA-256。trace 支持 VCD、FSDB、FST、VPD、WLF、WDB、GHW、TRN、LXT 等波形文件；其他数据库可先由项目工具导出 VCD。证据根目录和哈希按原契约核查。文档内的预期与实测来自关联的 CP 和 observation，复核人用实际数据库核对截图、采样窗口和判读。缺少计划指定的图会得到 `INCOMPLETE`，引用错运行、错文件或文件被修改会得到 `INVALID`。报告文件及 `latest/` 链接应放在输入根目录之外，避免生成报告使输入基线失效。
+
 ### 输入身份
 
 ```json

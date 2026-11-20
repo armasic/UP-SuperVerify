@@ -1,6 +1,6 @@
 ---
 name: up-superverify
-description: Use when digital IC or RTL projects need a verification plan, systematic functional or protocol verification, throughput or latency testing, defect repair and regression, or an evidence-backed verification delivery. Excludes design-only architecture work, formatting-only edits, and physical or PPA signoff.
+description: Use when digital IC or RTL projects need a verification plan, a module LRS and RTL handoff reviewed, systematic functional or protocol verification, throughput or latency testing, repair and regression, or a versioned report with measured waveforms. Excludes design-only architecture work and physical or PPA signoff.
 ---
 
 # up-superverify
@@ -19,6 +19,10 @@ description: Use when digital IC or RTL projects need a verification plan, syste
 | 实现、执行或继续验证 | 复用有效计划，建立测试、采集证据 | [测试与执行](references/testbench-and-execution.md) |
 | 定位失败、修复和回归 | 修复原规格内的 RTL/测试缺陷，复验及必要集成回归 | [修复与验收](references/repair-and-acceptance.md) |
 | 评估完成情况或交付正式报告 | 对照全部验收项出结论与明细 | [修复与验收](references/repair-and-acceptance.md)、[正式报告](references/reporting.md) |
+
+接收单模块设计时，打开需求规格书、LRS 和设计文档，核对上位条目、模块方向、端口、周期与实际 RTL/TB 文件清单。沿用 LRS ID 和项目版本后缀。把原型的复位、正常路径和边界记录列作已知证据，再按全部必验条目独立选取刺激、判据与关键采样窗口。缺少设计侧交接时，可直接从现有权威要求和当前代码起步。
+
+独立启动新项目时，四份正式文档默认采用小写 `_v主版本p次版本` 后缀，首版为 `_v0p1`。用户指定或项目已有的版本约定优先。在运行前将本次版本号填入验证计划的 `module_report.version`。
 
 按项目给出编号阶段、产物和完成条件，采用用户选择的“全部”或“做到第 N 步”。可按建立基线、策划、测试实现、执行、修复回归、验收交付细化，阶段数不固定。已有明确终点直接沿用；范围内连续推进，到终点交付后停止。候选失败或一批回归结束后，应依据新证据选择下一项工作。
 
@@ -54,4 +58,4 @@ python3 scripts/render_report.py --help
 
 校验仅覆盖已声明模型和当前可读证据的身份/关系，不证明需求无遗漏或 oracle 正确。语义审阅与实际 EDA 结果都不能由结构检查代替。
 
-正式交付采用简洁正文与完整明细附件：正文集中结论、环境、结果、缺陷回归、覆盖限制；附件保留具体条件、全部检查点、追溯和复现入口。公共配置写一次，影响验收的缺口留在正文。参考 [方法来源](references/method-origins.md) 了解借鉴边界。
+正式验证文档依次写**验证策略、验证方案、验证结果**。在结果中放入关键用例从本次仿真导出的波形，标出 LRS、用例、信号、采样边沿与预期/实测，附原始波形和运行入口。正式模块交付将计划中的项目版本用于文件名及正文，并与需求规格书、LRS、设计文档及 `latest/` 的实际指向核对。修后 RTL 和 TB 以最终清单/哈希回归。如尚缺关键波形，明列缺口并交阶段报告。具体契约及命令见[正式报告](references/reporting.md)和[数据契约](references/data-contract.md)。
