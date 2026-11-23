@@ -2,7 +2,7 @@
 """Render a concise evaluated report plus lossless declared test-detail CSV."""
 import argparse
 import csv
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 import io
 import json
 import os
@@ -155,7 +155,7 @@ def current_figures(plan, results, root):
         caption = (f"{row['case_id']} / {row['variant_id']} / {row['check_id']}（{row['requirement_ids']}），运行 {row['run_id']}。"
                    f"信号 {', '.join(wave['signals'])}，窗口 {wave['window']}。刺激 {row['stimulus']}。采样 {row['observe_at']}。"
                    f"预期 {row['expected']}，实测 {row['actual']}（{row['status']}）。原始波形 {wave['trace']}")
-        figures.append((Path(root) / wave["image"], caption))
+        figures.append((Path(root) / wave["image"], caption, row["check_id"] + " / " + row["run_id"], Path(root) / wave["trace"]))
     return figures
 
 
@@ -168,7 +168,7 @@ def markdown_text(title, sections, root, figures=(), output_dir=None):
         if heading == "实测波形":
             if not figures:
                 lines += ["本次没有可核对的实测波形图。", ""]
-            for path, caption in figures:
+            for path, caption, _, _ in figures:
                 url = quote(os.path.relpath(path, output_dir), safe="/")
                 lines += [f"![实测波形]({url})", "", public_text(caption, root), ""]
         for paragraph in paragraphs:
@@ -184,7 +184,7 @@ def heading_level(name):
     return 1 if name in {"结论", "验证策略", "验证方案", "验证结果"} else 2
 
 
-def word_bytes(title, sections, root, figures=()):
+def word_bytes(title, sections, root, figures=(), formal_info=None):
     try:
         from docx import Document
         from docx.oxml import OxmlElement
@@ -220,37 +220,60 @@ def word_bytes(title, sections, root, figures=()):
     doc.core_properties.author = ""
     doc.core_properties.last_modified_by = ""
     doc.core_properties.title = public_text(title, root)
-    doc.add_paragraph(public_text(title, root), "Title")
+    layout = None
+    if formal_info:
+        from formal_word import FormalLayout
+        layout = FormalLayout(doc, formal_info)
+    else:
+        doc.add_paragraph(public_text(title, root), "Title")
     for heading, paragraphs, tables in sections:
-        doc.add_heading(heading, heading_level(heading))
+        if layout:
+            if heading in {"结论", "验收缺口"}:
+                continue
+            layout.heading(heading, heading_level(heading))
+            if heading == "验证策略":
+                for name, notes, _ in sections:
+                    if name in {"结论", "验收缺口"}:
+                        for note in notes:
+                            doc.add_paragraph(public_text(note, root))
+        else:
+            doc.add_heading(heading, heading_level(heading))
         if heading == "实测波形":
             if not figures:
                 doc.add_paragraph("本次没有可核对的实测波形图。")
-            for path, caption in figures:
+            for path, caption, label, trace in figures:
                 figure = doc.add_paragraph()
                 figure.paragraph_format.keep_with_next = True
                 try:
-                    shape = figure.add_run().add_picture(str(path), width=Inches(6.5))
+                    shape = figure.add_run().add_picture(str(path), width=layout.width if layout else Inches(6.5))
                 except (InvalidImageStreamError, UnrecognizedImageError, UnexpectedEndOfFileError, ValueError, StructError, ZeroDivisionError):
                     raise ValueError("unreadable waveform PNG: " + path.name) from None
                 if shape.height > Inches(5):
                     shape.width = int(shape.width * Inches(5) / shape.height)
                     shape.height = Inches(5)
-                doc.add_paragraph(public_text(caption, root))
+                if layout:
+                    layout.caption("图", public_text(label, root))
+                caption_text = doc.add_paragraph(public_text(caption, root))
+                if layout:
+                    layout.evidence([("原始波形", trace), ("截图原件", path)], caption_text)
         for paragraph in paragraphs:
             doc.add_paragraph(public_text(paragraph, root))
         for headers, rows in tables:
+            if layout:
+                layout.caption("表", heading)
             table = doc.add_table(rows=1, cols=len(headers))
             table.style = "Table Grid"
             table.autofit = False
             borders = OxmlElement("w:tblBorders")
             for edge in ("top", "left", "bottom", "right", "insideH", "insideV"):
                 element = OxmlElement("w:" + edge)
-                for key, value in (("val", "single"), ("sz", "4"), ("color", "B8C0C8")):
+                for key, value in (("val", "single"), ("sz", "4"), ("color", "000000" if layout else "B8C0C8")):
                     element.set(qn("w:" + key), value)
                 borders.append(element)
             table._tbl.tblPr.append(borders)
             widths = {2: (1.25, 5.52), 3: (1.35, 3.82, 1.6), 4: (1.4, 1.05, 1.7, 2.62)}[len(headers)]
+            if layout:
+                widths = tuple(w * layout.width / Inches(sum(widths)) for w in widths)
             for column, width in zip(table.columns, widths):
                 column.width = Inches(width)
             for index, header in enumerate(headers):
@@ -268,7 +291,7 @@ def word_bytes(title, sections, root, figures=()):
                     cell.vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.CENTER
                     if row_index == 0:
                         shading = OxmlElement("w:shd")
-                        shading.set(qn("w:fill"), "EDF0F3")
+                        shading.set(qn("w:fill"), "E6E6E6" if layout else "EDF0F3")
                         cell._tc.get_or_add_tcPr().append(shading)
                     for paragraph in cell.paragraphs:
                         paragraph.paragraph_format.space_after = Pt(3)
@@ -279,6 +302,8 @@ def word_bytes(title, sections, root, figures=()):
             spacer = doc.add_paragraph()
             spacer.paragraph_format.space_after = Pt(0)
             spacer.paragraph_format.line_spacing = Pt(1)
+    if layout:
+        layout.finish()
     stream = io.BytesIO()
     doc.save(stream)
     return stream.getvalue()
@@ -304,6 +329,12 @@ def main(argv=None):
     parser.add_argument("--root", help="current project root; omission prevents ACCEPTED")
     parser.add_argument("--output", required=True, help="report path ending .md or .docx (relative to current directory)")
     parser.add_argument("--details", help="CSV attachment path; module exports keep the project version at the end")
+    parser.add_argument("--module-name", help="module printed on the formal cover if absent from the frozen plan")
+    parser.add_argument("--document-number", default="", help="assigned document number on the formal cover")
+    parser.add_argument("--task-number", default="", help="assigned project task number on the formal cover")
+    parser.add_argument("--issue-date", help="cover preparation date (YYYY-MM-DD); defaults to date of generation")
+    parser.add_argument("--soffice", help="LibreOffice executable for rendering, page-field caching and release checks")
+    parser.add_argument("--pdf", action="store_true", help="retain the checked PDF alongside the formal Word file")
     args = parser.parse_args(argv)
     try:
         output = Path(args.output)
@@ -315,12 +346,19 @@ def main(argv=None):
             print(json.dumps(outcome, ensure_ascii=False, indent=2), file=sys.stderr)
             return 1
         version = plan.get("module_report", {}).get("version")
+        formal = bool(version and output.suffix.lower() == ".docx")
+        if (args.pdf or args.soffice or args.module_name is not None or args.document_number or args.task_number or args.issue_date) and not formal:
+            raise ValueError("formal layout options require module_report and .docx output")
+        if args.pdf and not args.soffice:
+            raise ValueError("--pdf requires --soffice to render and check the released document")
         if version and not output.stem.endswith("_" + version):
             raise ValueError("report filename must end in _" + version + output.suffix)
         detail_stem = output.stem + "-details"
         if version:
             detail_stem = output.stem.removesuffix("_" + version) + "-details_" + version
         details = Path(args.details) if args.details else output.with_name(detail_stem + ".csv")
+        if version and not details.stem.endswith("_" + version):
+            raise ValueError("details filename must end in _" + version + ".csv")
         if output.resolve() == details.resolve():
             raise ValueError("report and details must have different output paths")
         root = Path(args.root).resolve() if args.root else None
@@ -331,25 +369,53 @@ def main(argv=None):
         protected = [(guard_root / p).resolve() for p in plan["inputs"]["roots"]]
         protected_files = [(guard_root / record["path"]).resolve() for run in results["runs"] for record in run["logs"]]
         protected_files += input_paths
-        for candidate in (output.resolve(), details.resolve()):
+        output_paths = [output.resolve(), details.resolve()]
+        if args.pdf:
+            output_paths.append(output.with_suffix(".pdf").resolve())
+        for candidate in output_paths:
             if candidate in protected_files or any(candidate == p or p in candidate.parents for p in protected):
                 raise ValueError("output must not replace inputs or evidence")
         title = plan["project"] + " 验证报告" + (" " + version if version else "")
         sections = report_sections(plan, results, outcome, os.path.relpath(details.resolve(), output.resolve().parent))
         figures = current_figures(plan, results, root)
+        formal_info = None
+        if formal:
+            name = plan["module_report"].get("module")
+            if args.module_name is not None and (not args.module_name.strip() or (name and args.module_name != name)):
+                raise ValueError("--module-name must be nonempty and match the name in the frozen plan")
+            name = name or args.module_name or plan["project"]
+            revision = ("当前运行 {current_runs} 次，有效通过检查点 {passed_checks}/{planned_checks} 个。"
+                        .format(**outcome["summary"]))
+            formal_info = dict(project=public_text(plan["project"], root), module=public_text(name, root),
+                               version=version, revision=revision, output_dir=output.resolve().parent,
+                               root=guard_root, document_number=public_text(args.document_number, root),
+                               has_figures=bool(figures), has_tables=any(tables for _, _, tables in sections),
+                               task_number=public_text(args.task_number, root),
+                               date=(date.fromisoformat(args.issue_date) if args.issue_date else date.today()).isoformat(),
+                               links=[("验证计划", input_paths[0]), ("运行与观察", input_paths[1]), ("完整明细", details.resolve())])
         # Finish generation in memory before touching outputs, including dependency checks.
         if output.suffix.lower() == ".md":
             body = markdown_text(title, sections, args.root, figures, output.resolve().parent).encode("utf-8")
         else:
-            body = word_bytes(title, sections, args.root, figures)
+            body = word_bytes(title, sections, args.root, figures, formal_info)
         stream = io.StringIO(newline="")
-        writer = csv.DictWriter(stream, fieldnames=DETAIL_FIELDS)
+        fields = ("report_version",) + DETAIL_FIELDS if version else DETAIL_FIELDS
+        writer = csv.DictWriter(stream, fieldnames=fields)
         writer.writeheader()
         for row in detail_rows(plan, results):
+            if version:
+                row["report_version"] = version
             writer.writerow({key: public_text(value, args.root) for key, value in row.items()})
+        layout_state = "CANDIDATE" if formal else "BRIEF"
+        if args.soffice:
+            from verify_layout import render_and_check
+            body, pdf = render_and_check(body, output.resolve().parent, args.soffice, details.resolve())
+            layout_state = "RENDERED"
+            if args.pdf:
+                _atomic_write(output.with_suffix(".pdf"), pdf)
         _atomic_write(details, stream.getvalue().encode("utf-8-sig"))
         _atomic_write(output, body)
-        print(json.dumps({"status": outcome["status"], "report": output.name, "details": details.name}, ensure_ascii=False))
+        print(json.dumps({"status": outcome["status"], "layout": layout_state, "report": output.name, "details": details.name}, ensure_ascii=False))
         return EXIT_CODES[outcome["status"]]
     except (ValueError, TypeError) as exc:
         print("report error: " + public_text(exc, args.root), file=sys.stderr)

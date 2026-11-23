@@ -18,11 +18,11 @@
 
 ## 结构与依赖
 
-入口 `SKILL.md`，内部参考位于 `references/`。`scripts/check_evidence.py` 检查计划/运行数据与当前输入身份；`scripts/render_report.py` 生成简洁正文和完整明细。精确格式见 [数据契约](references/data-contract.md)，交付写法见 [正式报告](references/reporting.md)。
+入口 `SKILL.md`，内部参考位于 `references/`。`scripts/check_evidence.py` 检查计划/运行数据与当前输入身份；`scripts/render_report.py` 生成简报或正式模块 Word 及完整明细；`scripts/verify_layout.py` 核对同书名 Word/PDF 的实排页码和证据链接。精确格式见 [数据契约](references/data-contract.md)，交付写法见 [正式报告](references/reporting.md)。
 
-核心脚本使用 Python 3.9+ 标准库；Word 导出需要 `python-docx`，PDF 需要可用渲染工具。技能本身不依赖 Superpowers、vplan-generator 或固定 UVM 框架。EDA 环境按项目配置，适用时使用独立的 up-duiker-nic 技能。
+核心脚本使用 Python 3.9+ 标准库；Word 导出需要 `python-docx`，正式排版渲染与核对还需要 LibreOffice 和 `pypdf`。技能本身不依赖 Superpowers、vplan-generator 或固定 UVM 框架。EDA 环境按项目配置，适用时使用独立的 up-duiker-nic 技能。
 
-正式报告依次写验证策略、验证方案和验证结果，附逐检查点明细。模块报告使用项目版本，并将本次运行的关键波形插入 Word。联合交付时核对需求、LRS、设计和验证四份文档，以及最终 RTL/TB 的身份。参见[报告示例命令](references/reporting.md)。
+正式报告依次写验证策略、验证方案和验证结果，附逐检查点明细。四份正式文档统一使用小写 `v主版本p次版本` 后缀，例如 `v0p1`；正式 Word 内嵌本次关键实测波形，带可核对的目录与图表页码。联合交付时核对需求、LRS、设计和验证四份文档，以及最终 RTL/TB 的身份。参见[报告示例命令](references/reporting.md)。
 
 ## 本机安装
 

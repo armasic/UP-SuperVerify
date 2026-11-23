@@ -1,6 +1,6 @@
 # 计划与结果数据契约
 
-本契约适用于 `schema_version: 1`，核心脚本要求 Python 3.9+ 标准库。Word 导出另需可选 `python-docx`；脚本不会自动安装依赖。
+本契约适用于 `schema_version: 1`，核心脚本要求 Python 3.9+ 标准库。Word 导出另需可选 `python-docx`。正式排版的 PDF 渲染和校核另需 LibreOffice 和 `pypdf`。
 
 计划描述声明范围，结果记录执行事实。两者分开保存，不允许结果中的摘要替代逐检查点证据。字段名严格检查，未列出的字段会报错；`configuration`、`parameters` 是项目自定的有限 JSON 对象。所有 JSON 对象禁止重复键和非有限数值。非空字符串不能用空白占位。
 
@@ -35,10 +35,10 @@ API：`load_json(path)` 严格读 JSON；`validate_plan(plan) -> list[str]` 返�
 单模块正式交付在运行前增加可选对象 `module_report`。既有独立验证计划可继续使用原格式。示例中的 `CP-COMMIT` 须替换为本计划已有的检查点 ID。
 
 ```json
-{"module_report":{"version":"v0p1","strategy":"逐项检查接受与提交边沿，以输入有效信号提前撤销区分早交和漏交。","waveform_checks":["CP-COMMIT"]}}
+{"module_report":{"version":"v0p1","module":"event_router","strategy":"逐项检查接受与提交边沿，以输入有效信号提前撤销区分早交和漏交。","waveform_checks":["CP-COMMIT"]}}
 ```
 
-`version` 填本次交付的版本号。没有既定写法的新项目默认从 `v0p1` 开始。若仅指定版本数字，例如 0.2，填写 `v0p2`。接收设计交接或项目已指定写法时沿用其原样，如 `V0.5`。输出文件名须以 `_<version>.docx` 或 `_<version>.md` 收尾。策略按本模块填写。`waveform_checks` 列出至少一个需要实测波形的关键 CP，可包括失败样本和修复后的边界。字段参与计划身份计算，计划变更后按新计划采证。
+`version` 填本次交付的版本号。格式固定为 `v[0-9]+p[0-9]+`，首版通常为 `v0p1`。旧模板标为 V0.5 时，本次若是相同修订使用 `v0p5`，新的修订按实际主次版本填写。报告和明细必须在扩展名前以 `_<version>` 收尾，PDF 与 Word 同书名。`module` 是可选模块名。已冻结的计划可用导出参数 `--module-name` 补充独立模块名；项目标识本身即为模块名时直接复用。策略按本模块填写。`waveform_checks` 列出至少一个需要实测波形的关键 CP，可包括失败样本和修复后的边界。字段参与计划身份计算，计划变更后按新计划采证。
 
 在对应的当前运行 observation 内加入 `waveform`。复用本条 CP 的 case、variant、预期和实际结果。对象包括同一 run 的原始波形文件、可嵌入的 PNG、信号名列表和采样时间窗口。
 
@@ -181,7 +181,7 @@ Case 必需 `id`、`description`、`requirements`（需求 ID 数组）、`varia
 
 报告正文包含计算结论、验收缺口、环境配置、逐需求结果、覆盖/吞吐/延迟、缺陷修复回归及范围限制。状态来自 `evaluate`，不会采信 `results.summary`。Word 使用中文黑色标题与紧凑表格，正文不设固定页数。导出 Word 后仍须按文档流程渲染并逐页检查；导出成功不等于视觉质量检查通过。
 
-完整 CSV 每个 CP/当前运行一行；未运行 CP 也保留一行 `NOT_RUN`。它保留需求映射及 `requirement_sources` 来源引用、case/变体 ID、参数、前置状态、具体刺激、观测时刻、预期、oracle、实现引用、接收者角色、激活/判别/对照、实际结果与日志路径，不裁去长文本。`run_metadata` 保存对应运行的完整记录，包括命令、种子、工具、起止时间、输入身份和日志哈希；未运行时为空对象。正文只汇总公共环境、基线和运行时间范围，不按每次运行重复这些栏目。正文与 CSV 会移除当前根路径及可识别的宿主绝对路径；相对复现路径和除法表达式保留。导出只去除可识别的绝对路径，不是任意敏感信息审查器，外发前仍按项目审核字段内容。
+正式模块的 CSV 在每行记录同一 `report_version`。无 `module_report` 的通用 CSV 保留既有列。完整 CSV 每个 CP/当前运行一行；未运行 CP 也保留一行 `NOT_RUN`。它保留需求映射及 `requirement_sources` 来源引用、case/变体 ID、参数、前置状态、具体刺激、观测时刻、预期、oracle、实现引用、接收者角色、激活/判别/对照、实际结果与日志路径，不裁去长文本。`run_metadata` 保存对应运行的完整记录，包括命令、种子、工具、起止时间、输入身份和日志哈希；未运行时为空对象。正文只汇总公共环境、基线和运行时间范围，不按每次运行重复这些栏目。正文与 CSV 会移除当前根路径及可识别的宿主绝对路径；相对复现路径和除法表达式保留。导出只去除可识别的绝对路径，不是任意敏感信息审查器，外发前仍按项目审核字段内容。
 
 小型可复现数据包在 [`tests/fixtures/evidence/`](../tests/fixtures/evidence/plan.json) 与 [results.json](../tests/fixtures/evidence/results.json)。它是虚构的契约示例，日志与数值不代表真实 RTL 测量。可用它验证 CLI、错误拒绝与报告排版，不用它宣称实际产品验证完成。
 

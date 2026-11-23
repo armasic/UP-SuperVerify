@@ -14,7 +14,7 @@ STATUSES = ("PASS", "FAIL", "BLOCKED", "SKIP", "NOT_RUN", "ERROR", "TIMEOUT")
 EXIT_CODES = {"ACCEPTED": 0, "INCOMPLETE": 2, "INVALID": 1, "PLAN_VALID": 0}
 BOUNDARY = "自动检查仅核对声明范围、结构和文件身份；需求完整性、判据独立性及正确性、排除授权真实性仍须语义审阅。"
 UNKNOWN = {"", "UNKNOWN", "TBD", "TODO", "UNDEFINED", "待确认", "未知"}
-MODULE_VERSION = r"[vV][0-9]+(?:[.p][0-9]+)*"
+MODULE_VERSION = r"v[0-9]+p[0-9]+"
 
 
 def load_json(path):
@@ -261,9 +261,11 @@ def validate_plan(plan):
                 if not needed.issubset(roles[vid]):
                     v.error("isolation", "variant " + vid + " lacks independent selected/unselected checks")
     if "module_report" in plan:
-        report = v.obj(plan["module_report"], "module_report", ("version", "strategy", "waveform_checks"))
+        report = v.obj(plan["module_report"], "module_report", ("version", "strategy", "waveform_checks"), ("module",))
         if not isinstance(report.get("version"), str) or not re.fullmatch(MODULE_VERSION, report["version"]):
-            v.error("module_report.version", "expected the project version, e.g. v0p1 for a new project")
+            v.error("module_report.version", "expected lowercase vMAJORpMINOR, e.g. v0p1")
+        if "module" in report:
+            v.text(report["module"], "module_report.module")
         v.text(report.get("strategy"), "module_report.strategy")
         for ref in v.strings(report.get("waveform_checks"), "module_report.waveform_checks", True):
             if ref not in check_ids:
