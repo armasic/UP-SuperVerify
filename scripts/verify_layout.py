@@ -64,27 +64,162 @@ def restore_pdf_links(doc, payload, directory):
     return payload
 
 
-def inspect_pair(doc, pdf, directory, pending_details=None, fill=False):
+COVER_LABELS = ("文件名称", "文件编号", "文件版本号", "项目任务号", "编制日期")
+
+
+def read_cover(doc):
+    """Read physical cover cells once, or the labeled paragraphs in an archived report."""
+    from docx.oxml.ns import qn
+    from docx.text.paragraph import Paragraph
+
+    fields = {}
+    tables = []
+    for block in doc.element.body:
+        if block.tag == qn("w:p"):
+            if block.xpath("./w:pPr/w:sectPr"):
+                break
+            label, tab, value = Paragraph(block, doc).text.partition("\t")
+            if tab and label.strip() in COVER_LABELS:
+                fields[label.strip()] = value.strip()
+        elif block.tag == qn("w:tbl"):
+            tables.append(block)
+    if not tables:
+        return fields, None
+    if len(tables) != 1 or len(tables[0].xpath("./w:tblGrid/w:gridCol")) != 6:
+        raise ValueError("invalid merged cover table: expected a single six-column grid")
+    rows = tables[0].xpath("./w:tr")
+    if len(rows) != 8:
+        raise ValueError("invalid merged cover table: expected eight rows")
+    texts = {}
+    for index in (1, 2, 3, 4, 5, 7):
+        cells = rows[index].xpath("./w:tc")
+        whole_row = index in (1, 7)
+        if (len(cells) != (1 if whole_row else 2) or
+                cells[-1].xpath("./w:tcPr/w:gridSpan/@w:val") != ["6" if whole_row else "5"]):
+            raise ValueError("invalid merged cover field in row " + str(index + 1))
+        texts[index] = "".join(cells[-1].xpath(".//w:t/text()")).strip()
+    fields = {}
+    for label, row in zip(COVER_LABELS, (2, 3, 4, 5, 7)):
+        match = re.fullmatch(re.escape(label) + r"(?:\s*[:：]\s*|\s+)(.*)", texts[row], re.S)
+        if not match:
+            raise ValueError("missing cover field: " + label)
+        fields[label] = match[1].strip()
+    return fields, texts[1]
+
+
+def check_table_cover(doc, fields, project, pdf_cover):
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+
+    normal = doc.styles["Normal"]
+    if (normal.font.size is None or normal.font.size.pt != 14 or normal.font.name != "Times New Roman"
+            or normal.element.xpath("./w:rPr/w:rFonts/@w:eastAsia") != ["宋体"]):
+        raise ValueError("formal template body requires 14 pt Song and Times New Roman")
+    for n in (1, 2, 3):
+        name = "Heading " + str(n)
+        if name not in doc.styles or doc.styles[name].element.xpath("./w:rPr/w:rFonts/@w:eastAsia") != ["黑体"]:
+            raise ValueError("formal template requires Hei chapter heading styles")
+    for section in doc.sections:
+        margins = (section.top_margin, section.left_margin, section.bottom_margin, section.right_margin)
+        if [m.twips if m is not None else None for m in margins] != [1644, 1418, 1418, 1134]:
+            raise ValueError("formal template section margins differ from the reference")
+    title = fields["文件名称"]
+    module = doc.core_properties.subject
+    if not project or not title or not module or not fields["编制日期"]:
+        raise ValueError("visible cover is missing the project, module title or issue date")
+    # Previously published table-cover reports used an automatically generated
+    # file title but recorded the project and version in the metadata title.
+    archived_default = (title == module + "模块验证文档" and
+                        doc.core_properties.title == f"{project} 验证报告 {doc.core_properties.version}")
+    if doc.core_properties.title != title and not archived_default:
+        raise ValueError("formal Word title differs from the visible cover")
+    for section in list(doc.sections)[1:]:
+        if not any(p.text.strip() == module and p.alignment == WD_ALIGN_PARAGRAPH.RIGHT for p in section.header.paragraphs):
+            raise ValueError("module name in the right header differs from the Word subject")
+    printed = "".join(pdf_cover.split())
+    for value in (project, *fields, *fields.values()):
+        if "".join(value.split()) not in printed:
+            raise ValueError("PDF cover differs from the editable cover: " + value)
+    return module
+
+
+def check_native_indexes(doc, front):
+    """Confirm each native Word TOC encloses its own editable, cached index rows."""
+    from docx.oxml.ns import qn
+
+    outlines = {"SVContents": r'\\o\s+"1-[1-9]"',
+                "SVTables": r'\\c\s+"表"', "SVFigures": r'\\c\s+"图"'}
+    sections = {}
+    current = None
+    for p in front:
+        for name in p.xpath("./w:bookmarkStart/@w:name"):
+            if name in outlines:
+                if name in sections:
+                    raise ValueError("duplicate native Word index heading: " + name)
+                current = sections[name] = []
+        if current is not None:
+            current.append(p)
+    expected = {"SVContents"}
+    for instruction in doc.element.xpath(".//w:fldSimple/@w:instr"):
+        tokens = instruction.strip().split()
+        if tokens[:2] == ["SEQ", "表"]:
+            expected.add("SVTables")
+        elif tokens[:2] == ["SEQ", "图"]:
+            expected.add("SVFigures")
+    if sections.keys() != expected:
+        raise ValueError("native Word index headings do not match the report chapters and captions")
+    for name, paragraphs in sections.items():
+        state, code, references = "before", [], 0
+        for p in paragraphs:
+            for node in p.iter():
+                if node.tag == qn("w:fldChar"):
+                    marker = node.get(qn("w:fldCharType"))
+                    state = {("before", "begin"): "code", ("code", "separate"): "result",
+                             ("result", "end"): "after"}.get((state, marker))
+                    if state is None:
+                        raise ValueError("invalid native Word index field boundaries: " + name)
+                elif node.tag == qn("w:instrText") and state == "code":
+                    code.append(node.text or "")
+                elif node.tag == qn("w:fldSimple") and node.get(qn("w:instr"), "").split()[:1] == ["PAGEREF"]:
+                    if state != "result":
+                        raise ValueError("cached page reference outside the native Word index: " + name)
+                    references += 1
+                elif node.tag == qn("w:hyperlink") and node.get(qn("w:anchor")) and state != "result":
+                    raise ValueError("cached hyperlink outside the native Word index: " + name)
+        instruction = "".join(code).strip()
+        if (state != "after" or not references or not re.match(r"^TOC\s", instruction, re.I)
+                or not re.search(outlines[name], instruction) or not re.search(r'\\h\b', instruction)):
+            raise ValueError("missing or incorrect native Word index instruction: " + name)
+
+
+def inspect_pair(doc, pdf, directory, pending_details=None, fill=False, *, pdf_directory=None):
     from docx.oxml.ns import qn
     from check_evidence import MODULE_VERSION, load_json
 
     version = doc.core_properties.version
     sections = [[]]
+    front_nodes = []
     for p in doc.paragraphs:
         if p._p.xpath("./w:pPr/w:sectPr"):
             sections.append([])
         else:
             sections[-1].append(p.text.strip())
-    cover = dict(line.split("\t", 1) for line in sections[0] if "\t" in line)
+            if len(sections) == 2:
+                front_nodes.append(p._p)
+    cover, project = read_cover(doc)
     if len(sections) != 3 or not re.fullmatch(MODULE_VERSION, version) or cover.get("文件版本号") != version:
         raise ValueError("visible cover and formal Word version must match")
-    for label in ("文件名称", "文件编号", "项目任务号", "编制日期"):
-        if not any(line.split("\t")[0] == label for line in sections[0]):
+    for label in COVER_LABELS:
+        if label not in cover:
             raise ValueError("missing cover field: " + label)
     front = sections[1]
-    if "修订记录" not in front or not any(s.split()[:1] == [version] for s in front[front.index("修订记录")+1:front.index("目录")]):
+    if ("修订记录" not in front or "目录" not in front or
+            not any(s.split()[:1] == [version] for s in front[front.index("修订记录")+1:front.index("目录")])):
         raise ValueError("current revision record does not match the cover")
-    if not re.search(r"(?<!\w)" + re.escape(version) + r"(?!\w)", pdf.pages[0].extract_text()):
+    pdf_cover = pdf.pages[0].extract_text()
+    module = check_table_cover(doc, cover, project, pdf_cover) if project is not None else None
+    if project is not None:
+        check_native_indexes(doc, front_nodes)
+    if not re.search(r"(?<!\w)" + re.escape(version) + r"(?!\w)", pdf_cover):
         raise ValueError("PDF cover is missing the current release version")
 
     fields = [f for f in doc.element.xpath(".//w:fldSimple") if f.get(qn("w:instr"), "").split()[:1] == ["PAGEREF"]]
@@ -105,6 +240,8 @@ def inspect_pair(doc, pdf, directory, pending_details=None, fill=False):
         raise ValueError("PDF does not include a separate cover and front matter")
     contents = destinations.get("SVContents")
     indexes = [destinations.get(name) for name in ("SVTables", "SVFigures") if name in bookmarks]
+    if project is not None and (contents is None or contents <= 1):
+        raise ValueError("chapter contents must start on a page after the revision record")
     if contents is None or any(n is None or not contents < n < body for n in indexes) or indexes != sorted(indexes):
         raise ValueError("chapter contents must precede the separate table and figure indexes")
     numbers = [destinations[a] - body + 1 for a in anchors]
@@ -118,21 +255,31 @@ def inspect_pair(doc, pdf, directory, pending_details=None, fill=False):
         footer_ref[0].text = str(body_count)
     elif footer_ref[0].text != str(body_count):
         raise ValueError("cached body page count differs from the rendered document")
-    for field, number in zip(fields, numbers):
+    labels_by_page = {}
+    for field, anchor, number in zip(fields, anchors, numbers):
         cache = list(field.iter(qn("w:t")))
         local = field.getparent().xpath("./w:hyperlink/@w:anchor")
-        if len(cache) != 1 or local != [field.get(qn("w:instr")).split()[1]]:
+        if len(cache) != 1 or local != [anchor]:
             raise ValueError("index label and page reference do not share a destination")
         if fill:
             cache[0].text = str(number)
         elif cache[0].text != str(number):
             raise ValueError("cached Word page differs from rendered destination")
+        if project is not None:
+            label = "".join(field.getparent().xpath("./w:hyperlink//w:t/text()"))
+            labels_by_page.setdefault(destinations[anchor], []).append(label)
     indexed, pdf_links = [], set()
     for index, page in enumerate(pdf.pages):
         footer = []
+        section = doc.sections[0 if index == 0 else 1 if index < body else 2]
+        # Reference and archived documents have different footer distances.
+        # Their text baseline lies between the footer and the body margin.
+        footer_distance = section.footer_distance.pt if section.footer_distance is not None else 36
+        bottom_margin = section.bottom_margin.pt if section.bottom_margin is not None else 72
+        footer_top = (footer_distance + bottom_margin) / 2
 
         def visit(text, cm, tm, font, size):
-            if text.strip() and 0 < tm[5]*cm[3] + cm[5] < 42:
+            if text.strip() and 0 < tm[5]*cm[3] + cm[5] < footer_top:
                 footer.append(text.strip())
 
         text = page.extract_text(visitor_text=visit)
@@ -145,15 +292,21 @@ def inspect_pair(doc, pdf, directory, pending_details=None, fill=False):
                        and sorted(re.sub(r"\d+", "", printed)) == sorted("第页共页"))
         if not correct:
             raise ValueError(f"incorrect printed footer on PDF page {index+1}: {footer}")
+        compact = "".join(text.split())
+        for label in labels_by_page.get(index, []):
+            if not label or "".join(label.split()) not in compact:
+                raise ValueError(f"indexed heading or caption differs on PDF page {index+1}: {label}")
         if 0 < index < body:
             indexed.extend(int(n) for n in re.findall(r"\.{2,}\s*(\d+)", text))
         for ref in page.get("/Annots", []):
             action = ref.get_object().get("/A")
             if action and "/URI" in action:
                 pdf_links.add(str(action["/URI"]))
-    if indexed != numbers:
+    # Writer may use the native TOC's cached text in its first PDF. That pass
+    # measures bookmark destinations; the final PDF must print every measured page.
+    if not fill and indexed != numbers:
         raise ValueError("printed contents or figure/table page differs from PDF destination")
-    pdf_targets = {relative_target(uri, directory) for uri in pdf_links}
+    pdf_targets = {relative_target(uri, pdf_directory or directory) for uri in pdf_links}
     for rel in doc.part.rels.values():
         if not rel.is_external:
             continue
@@ -170,8 +323,17 @@ def inspect_pair(doc, pdf, directory, pending_details=None, fill=False):
         links[label] = (directory / unquote(uri)).resolve()
     if not {"验证计划", "运行与观察", "完整明细"} <= set(links):
         raise ValueError("required plan, results or details link is missing")
-    if load_json(links["验证计划"]).get("module_report", {}).get("version") != version:
+    plan = load_json(links["验证计划"])
+    report = plan.get("module_report", {})
+    if report.get("version") != version:
         raise ValueError("linked plan version differs from the visible cover")
+    if project is not None:
+        from render_report import public_text
+        # Rendering removes private absolute paths. Resolve the same display form
+        # for a plan stored in its project root or any project subdirectory.
+        for expected, printed in ((plan.get("project"), project), (report.get("module"), module)):
+            if expected is not None and not any(public_text(expected, root) == printed for root in (None, *links["验证计划"].parents)):
+                raise ValueError("linked plan project or module differs from the visible cover")
     details = links["完整明细"]
     if details.suffix.lower() != ".csv" or not details.stem.endswith("_" + version):
         raise ValueError("linked CSV filename differs from the visible cover")
@@ -236,14 +398,19 @@ def main(argv=None):
         Document, PdfReader = libraries()
         if args.word.suffix.lower() != ".docx":
             raise ValueError("expected the formal .docx")
+        word_target = args.word.resolve(strict=True)
         pdf = args.word.with_suffix(".pdf")
-        word = args.word.read_bytes()
+        # Check any explicit PDF entry so stale or dangling links are reported.
+        if args.word.is_symlink() and not (pdf.exists() or pdf.is_symlink()):
+            pdf = word_target.with_suffix(".pdf")
+        word = word_target.read_bytes()
         doc = Document(io.BytesIO(word))
         version = doc.core_properties.version
-        if not re.fullmatch(MODULE_VERSION, version) or not args.word.resolve().stem.endswith("_" + version):
+        if not re.fullmatch(MODULE_VERSION, version) or not word_target.stem.endswith("_" + version):
             raise ValueError("filename and formal Word version must match")
         payload = pdf.read_bytes()
-        info = inspect_pair(doc, PdfReader(io.BytesIO(payload)), args.word.absolute().parent)
+        info = inspect_pair(doc, PdfReader(io.BytesIO(payload)), args.word.absolute().parent,
+                            pdf_directory=pdf.absolute().parent)
         if doc.core_properties.identifier != layout_identity(word, payload):
             raise ValueError("Word content and PDF no longer match the checked render")
         print(json.dumps(info))

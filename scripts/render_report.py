@@ -21,11 +21,12 @@ DETAIL_FIELDS = ("requirement_ids", "requirement_sources", "case_id", "case_desc
                  "check_count", "run_id", "run_metadata", "log_paths", "waveform")
 
 
-def public_text(value, root=None):
+def public_text(value, root=None, *, waveform=False):
     """Retain relative reproduction paths while removing absolute host paths."""
     def clean(item):
         if isinstance(item, dict):
-            return {key: clean(child) for key, child in item.items()}
+            # A leading slash in a declared signal identifies a scope in the waveform.
+            return {key: child if waveform and key == "signals" else clean(child) for key, child in item.items()}
         if isinstance(item, list):
             return [clean(child) for child in item]
         if not isinstance(item, str):
@@ -152,9 +153,10 @@ def current_figures(plan, results, root):
         wave = row["waveform"]
         if not wave or not row["check_count"] or row["status"] not in {"PASS", "FAIL"}:
             continue
-        caption = (f"{row['case_id']} / {row['variant_id']} / {row['check_id']}（{row['requirement_ids']}），运行 {row['run_id']}。"
-                   f"信号 {', '.join(wave['signals'])}，窗口 {wave['window']}。刺激 {row['stimulus']}。采样 {row['observe_at']}。"
-                   f"预期 {row['expected']}，实测 {row['actual']}（{row['status']}）。原始波形 {wave['trace']}")
+        identity = f"{row['case_id']} / {row['variant_id']} / {row['check_id']}（{row['requirement_ids']}），运行 {row['run_id']}。"
+        measurement = (f"窗口 {wave['window']}。刺激 {row['stimulus']}。采样 {row['observe_at']}。"
+                       f"预期 {row['expected']}，实测 {row['actual']}（{row['status']}）。原始波形 {wave['trace']}")
+        caption = public_text(identity, root) + "信号 " + ", ".join(wave['signals']) + "，" + public_text(measurement, root)
         figures.append((Path(root) / wave["image"], caption, row["check_id"] + " / " + row["run_id"], Path(root) / wave["trace"]))
     return figures
 
@@ -170,7 +172,7 @@ def markdown_text(title, sections, root, figures=(), output_dir=None):
                 lines += ["本次没有可核对的实测波形图。", ""]
             for path, caption, _, _ in figures:
                 url = quote(os.path.relpath(path, output_dir), safe="/")
-                lines += [f"![实测波形]({url})", "", public_text(caption, root), ""]
+                lines += [f"![实测波形]({url})", "", caption, ""]
         for paragraph in paragraphs:
             lines += [public_text(paragraph, root), ""]
         for headers, rows in tables:
@@ -194,29 +196,33 @@ def word_bytes(title, sections, root, figures=(), formal_info=None):
         from docx.shared import Inches, Pt, RGBColor
     except ImportError:
         raise ValueError("Word export requires optional python-docx; no package was installed. Use .md or provide an environment with python-docx.") from None
-    doc = Document()
-    section = doc.sections[0]
-    section.page_width, section.page_height = Inches(8.27), Inches(11.69)
-    section.top_margin = section.bottom_margin = Inches(0.7)
-    section.left_margin = section.right_margin = Inches(0.75)
-    for name, size in (("Normal", 11), ("Title", 20), ("Heading 1", 13.5), ("Heading 2", 12)):
-        style = doc.styles[name]
-        style.font.name = "Arial"
-        style.font.size = Pt(size)
-        style.font.color.rgb = RGBColor(0, 0, 0)
-        style.font.underline = False
-        fonts = style.element.get_or_add_rPr().get_or_add_rFonts()
-        for key in list(fonts.attrib):
-            if "theme" in key.lower():
-                del fonts.attrib[key]
-        fonts.set(qn("w:eastAsia"), "Microsoft YaHei")
-        # The bundled default template contains a blue Title paragraph border.
-        for border in style.element.xpath("./w:pPr/w:pBdr"):
-            border.getparent().remove(border)
-        style.paragraph_format.space_after = Pt(6)
-        style.paragraph_format.line_spacing = 1.1
-    doc.styles["Title"].paragraph_format.space_after = Pt(12)
-    doc.styles["Heading 1"].paragraph_format.space_before = Pt(10)
+    if formal_info:
+        from formal_word import load_module_template
+        doc = load_module_template()
+    else:
+        doc = Document()
+        section = doc.sections[0]
+        section.page_width, section.page_height = Inches(8.27), Inches(11.69)
+        section.top_margin = section.bottom_margin = Inches(0.7)
+        section.left_margin = section.right_margin = Inches(0.75)
+        for name, size in (("Normal", 11), ("Title", 20), ("Heading 1", 13.5), ("Heading 2", 12)):
+            style = doc.styles[name]
+            style.font.name = "Arial"
+            style.font.size = Pt(size)
+            style.font.color.rgb = RGBColor(0, 0, 0)
+            style.font.underline = False
+            fonts = style.element.get_or_add_rPr().get_or_add_rFonts()
+            for key in list(fonts.attrib):
+                if "theme" in key.lower():
+                    del fonts.attrib[key]
+            fonts.set(qn("w:eastAsia"), "Microsoft YaHei")
+            # The bundled default template contains a blue Title paragraph border.
+            for border in style.element.xpath("./w:pPr/w:pBdr"):
+                border.getparent().remove(border)
+            style.paragraph_format.space_after = Pt(6)
+            style.paragraph_format.line_spacing = 1.1
+        doc.styles["Title"].paragraph_format.space_after = Pt(12)
+        doc.styles["Heading 1"].paragraph_format.space_before = Pt(10)
     doc.core_properties.author = ""
     doc.core_properties.last_modified_by = ""
     doc.core_properties.title = public_text(title, root)
@@ -242,7 +248,7 @@ def word_bytes(title, sections, root, figures=(), formal_info=None):
             if not figures:
                 doc.add_paragraph("本次没有可核对的实测波形图。")
             for path, caption, label, trace in figures:
-                figure = doc.add_paragraph()
+                figure = doc.add_paragraph(style="插图位置" if layout else None)
                 figure.paragraph_format.keep_with_next = True
                 try:
                     shape = figure.add_run().add_picture(str(path), width=layout.width if layout else Inches(6.5))
@@ -253,7 +259,7 @@ def word_bytes(title, sections, root, figures=(), formal_info=None):
                     shape.height = Inches(5)
                 if layout:
                     layout.caption("图", public_text(label, root))
-                caption_text = doc.add_paragraph(public_text(caption, root))
+                caption_text = doc.add_paragraph(caption)
                 if layout:
                     layout.evidence([("原始波形", trace), ("截图原件", path)], caption_text)
         for paragraph in paragraphs:
@@ -262,17 +268,20 @@ def word_bytes(title, sections, root, figures=(), formal_info=None):
             if layout:
                 layout.caption("表", heading)
             table = doc.add_table(rows=1, cols=len(headers))
-            table.style = "Table Grid"
+            table.style = "PLM table" if layout else "Table Grid"
             table.autofit = False
-            borders = OxmlElement("w:tblBorders")
-            for edge in ("top", "left", "bottom", "right", "insideH", "insideV"):
-                element = OxmlElement("w:" + edge)
-                for key, value in (("val", "single"), ("sz", "4"), ("color", "000000" if layout else "B8C0C8")):
-                    element.set(qn("w:" + key), value)
-                borders.append(element)
-            table._tbl.tblPr.append(borders)
+            if not layout:
+                borders = OxmlElement("w:tblBorders")
+                for edge in ("top", "left", "bottom", "right", "insideH", "insideV"):
+                    element = OxmlElement("w:" + edge)
+                    for key, value in (("val", "single"), ("sz", "4"), ("color", "B8C0C8")):
+                        element.set(qn("w:" + key), value)
+                    borders.append(element)
+                table._tbl.tblPr.append(borders)
             widths = {2: (1.25, 5.52), 3: (1.35, 3.82, 1.6), 4: (1.4, 1.05, 1.7, 2.62)}[len(headers)]
             if layout:
+                if heading == "验证方案":
+                    widths = (1.35, 2.15, 3.27)
                 widths = tuple(w * layout.width / Inches(sum(widths)) for w in widths)
             for column, width in zip(table.columns, widths):
                 column.width = Inches(width)
@@ -289,15 +298,18 @@ def word_bytes(title, sections, root, figures=(), formal_info=None):
                 for index, cell in enumerate(row.cells):
                     cell.width = Inches(widths[index])
                     cell.vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.CENTER
-                    if row_index == 0:
+                    if row_index == 0 and not layout:
                         shading = OxmlElement("w:shd")
-                        shading.set(qn("w:fill"), "E6E6E6" if layout else "EDF0F3")
+                        shading.set(qn("w:fill"), "EDF0F3")
                         cell._tc.get_or_add_tcPr().append(shading)
                     for paragraph in cell.paragraphs:
-                        paragraph.paragraph_format.space_after = Pt(3)
-                        paragraph.paragraph_format.space_before = Pt(3)
+                        if layout:
+                            paragraph.style = doc.styles["表格正文"]
+                        paragraph.paragraph_format.space_after = Pt(1 if layout else 3)
+                        paragraph.paragraph_format.space_before = Pt(1 if layout else 3)
                         for run in paragraph.runs:
-                            run.font.size = Pt(9)
+                            if not layout:
+                                run.font.size = Pt(9)
                             run.bold = row_index == 0
             spacer = doc.add_paragraph()
             spacer.paragraph_format.space_after = Pt(0)
@@ -330,6 +342,7 @@ def main(argv=None):
     parser.add_argument("--output", required=True, help="report path ending .md or .docx (relative to current directory)")
     parser.add_argument("--details", help="CSV attachment path; module exports keep the project version at the end")
     parser.add_argument("--module-name", help="module printed on the formal cover if absent from the frozen plan")
+    parser.add_argument("--title", help="registered document title on the formal cover and in Word metadata")
     parser.add_argument("--document-number", default="", help="assigned document number on the formal cover")
     parser.add_argument("--task-number", default="", help="assigned project task number on the formal cover")
     parser.add_argument("--issue-date", help="cover preparation date (YYYY-MM-DD); defaults to date of generation")
@@ -347,7 +360,7 @@ def main(argv=None):
             return 1
         version = plan.get("module_report", {}).get("version")
         formal = bool(version and output.suffix.lower() == ".docx")
-        if (args.pdf or args.soffice or args.module_name is not None or args.document_number or args.task_number or args.issue_date) and not formal:
+        if (args.pdf or args.soffice or args.module_name is not None or args.title is not None or args.document_number or args.task_number or args.issue_date) and not formal:
             raise ValueError("formal layout options require module_report and .docx output")
         if args.pdf and not args.soffice:
             raise ValueError("--pdf requires --soffice to render and check the released document")
@@ -381,12 +394,15 @@ def main(argv=None):
         formal_info = None
         if formal:
             name = plan["module_report"].get("module")
+            if args.title is not None and not args.title.strip():
+                raise ValueError("--title requires a nonempty document title")
             if args.module_name is not None and (not args.module_name.strip() or (name and args.module_name != name)):
                 raise ValueError("--module-name must be nonempty and match the name in the frozen plan")
             name = name or args.module_name or plan["project"]
             revision = ("当前运行 {current_runs} 次，有效通过检查点 {passed_checks}/{planned_checks} 个。"
                         .format(**outcome["summary"]))
             formal_info = dict(project=public_text(plan["project"], root), module=public_text(name, root),
+                               title=public_text(args.title.strip(), root) if args.title is not None else None,
                                version=version, revision=revision, output_dir=output.resolve().parent,
                                root=guard_root, document_number=public_text(args.document_number, root),
                                has_figures=bool(figures), has_tables=any(tables for _, _, tables in sections),
@@ -405,7 +421,8 @@ def main(argv=None):
         for row in detail_rows(plan, results):
             if version:
                 row["report_version"] = version
-            writer.writerow({key: public_text(value, args.root) for key, value in row.items()})
+            writer.writerow({key: public_text(value, args.root, waveform=(key == "waveform"))
+                             for key, value in row.items()})
         layout_state = "CANDIDATE" if formal else "BRIEF"
         if args.soffice:
             from verify_layout import render_and_check

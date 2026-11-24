@@ -1,6 +1,8 @@
 """Module delivery against a fictional ledger. The one-pixel image only tests embedding."""
 import base64
+import csv
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
@@ -9,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 import zipfile
 
 BASE = Path(__file__).resolve().parents[1]
@@ -36,7 +39,7 @@ class ModuleReportTests(unittest.TestCase):
             path.write_bytes(content)
             self.run["logs"].append(dict(path=name, sha256=file_sha256(path)))
         self.obs = self.data["observations"][1]
-        self.obs["waveform"] = dict(trace=self.trace, image=self.pic, signals=["clk", "A", "B"], window="20–30 ns")
+        self.obs["waveform"] = dict(trace=self.trace, image=self.pic, signals=["clk", "/tb_router/dut/ready", "B"], window="20–30 ns")
 
     def export(self, name, *options):
         for filename, data in (("plan.json", self.plan), ("results.json", self.data)):
@@ -53,10 +56,12 @@ class ModuleReportTests(unittest.TestCase):
         self.assertLess(body.index("## 验证策略"), body.index("## 验证方案"))
         self.assertLess(body.index("## 验证方案"), body.index("## 验证结果"))
         for fragment in ("v0p5", self.plan["module_report"]["strategy"], "REQ-ROUTE", "VAR-A", "CP-B", "RUN-1",
-                         "20–30 ns", "B=0", "clk", "select=A", "../logs/key%20case.png", self.trace):
+                         "20–30 ns", "B=0", "clk", "/tb_router/dut/ready", "select=A", "../logs/key%20case.png", self.trace):
             self.assertIn(fragment, body)
         self.assertNotIn(str(self.root), body)
-        self.assertTrue((self.root / "docs/verification-details_v0p5.csv").is_file())
+        with (self.root / "docs/verification-details_v0p5.csv").open(encoding="utf-8-sig", newline="") as stream:
+            wave = next(json.loads(row["waveform"]) for row in csv.DictReader(stream) if row["waveform"])
+        self.assertEqual(wave["signals"], self.obs["waveform"]["signals"])
 
     def test_missing_capture_is_an_incomplete_report(self):
         del self.obs["waveform"]
@@ -110,13 +115,26 @@ class ModuleReportTests(unittest.TestCase):
     @unittest.skipUnless(importlib.util.find_spec("docx"), "optional Word dependency")
     def test_word_contains_version_order_caption_and_embedded_picture(self):
         name = "docs/verification_v0p5.docx"
-        result = self.export(name)
+        result = self.export(name, "--document-number", "VERIFY-27", "--task-number", "MOD-18",
+                             "--issue-date", "2025-08-15")
         self.assertEqual(result.returncode, 0, result.stderr)
         from docx import Document
         doc = Document(self.root / name)
         self.assertEqual(len(doc.sections), 3)
-        self.assertIn("v0p5", " ".join(p.text for p in doc.paragraphs[:8]))
-        self.assertTrue(any("路由器" in p.text for p in doc.paragraphs[:8]))
+        self.assertEqual(doc.core_properties.subject, "路由器")
+        cover = doc.tables[0]._tbl
+        self.assertIs(doc.element.body[0], cover)
+        self.assertEqual(len(cover.xpath("./w:tblGrid/w:gridCol")), 6)
+        cover_rows = cover.xpath("./w:tr")
+        self.assertEqual(len(cover_rows), 8)
+        for row, value in ((1, self.plan["project"]), (2, "文件名称：路由器模块验证文档"),
+                           (3, "文件编号：VERIFY-27"), (4, "文件版本号：v0p5"),
+                           (5, "项目任务号：MOD-18"), (7, "编制日期 2025-08-15")):
+            self.assertEqual("".join(cover_rows[row].xpath(".//w:t/text()")), value)
+            self.assertEqual(cover_rows[row].xpath("./w:tc/w:tcPr/w:gridSpan/@w:val"),
+                             ["6" if row in (1, 7) else "5"])
+        self.assertTrue(all(t.style.name == "PLM table" for t in doc.tables[1:]))
+        self.assertTrue(all(t.cell(0, 0).paragraphs[0].style.name == "表格正文" for t in doc.tables[1:]))
         self.assertEqual([section._sectPr.xpath("w:pgNumType/@w:fmt") for section in doc.sections], [[], ["upperRoman"], ["decimal"]])
         self.assertTrue(all(abs(s.page_width.mm-210)<0.1 and abs(s.page_height.mm-297)<0.1 for s in doc.sections))
         self.assertTrue(all(s._sectPr.xpath("w:pgNumType/@w:start") == ["1"] for s in list(doc.sections)[1:]))
@@ -129,10 +147,32 @@ class ModuleReportTests(unittest.TestCase):
         fields = doc.element.xpath('.//w:fldSimple/@w:instr')
         references = {field.split()[1] for field in fields if field.strip().startswith('PAGEREF ')}
         self.assertGreater(len(references), 10)
-        for label in ("文件名称", "文件编号", "文件版本号", "项目任务号", "编制日期"):
-            self.assertTrue(any(p.text.startswith(label + "\t") for p in doc.paragraphs))
-        self.assertTrue(any(p.text.startswith("表 2-1") for p in doc.paragraphs))
-        self.assertTrue(any(p.text.startswith("图 3-1") for p in doc.paragraphs))
+        # A reviewer can update the entire index after adding a heading or caption.
+        # Linked page-number fields alone can only refresh existing rows.
+        for anchor, code in (("SVContents", r'TOC \o "1-3" \h \z \u'), ("SVTables", r'TOC \h \z \c "表"'),
+                             ("SVFigures", r'TOC \h \z \c "图"')):
+            title = doc.element.body.xpath(f'./w:p[w:bookmarkStart[@w:name="{anchor}"]]')[0]
+            entry = title.getnext()
+            self.assertEqual([t.strip() for t in entry.xpath('./w:r/w:instrText/text()')], [code])
+            while entry.getnext().xpath('./w:fldSimple'):
+                entry = entry.getnext()
+            self.assertEqual(entry.xpath('./w:r/w:fldChar/@w:fldCharType')[-1], 'end')
+        for para in doc.paragraphs:
+            if para.text in ("修订记录", "目录", "表目录", "图目录"):
+                self.assertEqual(para.style.name, "TOC 标题1")
+            if para.text in ("目录", "表目录"):
+                self.assertTrue(para.paragraph_format.page_break_before)
+        self.assertTrue(any(p.style.name == "toc 1" for p in doc.paragraphs))
+        self.assertTrue(any(p.style.name == "table of figures" for p in doc.paragraphs))
+        captions = [p for p in doc.paragraphs if p.style.name == "Caption"]
+        cached = ["".join(p._p.xpath(".//w:t/text()")) for p in captions]
+        self.assertTrue(any(text.startswith("表 2-1") for text in cached))
+        self.assertTrue(any(text.startswith("图 3-1") for text in cached))
+        for p, title in zip(captions, cached):
+            ordinal = title.split("　")[0].split("-")[1]
+            switch = r"\r 1" if ordinal == "1" else r"\s 1"
+            self.assertEqual(p._p.xpath("./w:fldSimple/@w:instr"),
+                             [r"STYLEREF 1 \n", "SEQ " + title[0] + r" \* ARABIC " + switch])
         for sec in list(doc.sections)[1:]:
             self.assertEqual(sec.header.paragraphs[0].text, "路由器")
             self.assertEqual(sec.header.paragraphs[0].alignment, 2)
@@ -140,6 +180,7 @@ class ModuleReportTests(unittest.TestCase):
         for sec in doc.sections:
             self.assertEqual([getattr(sec, a).twips for a in ("top_margin", "left_margin", "bottom_margin", "right_margin")], [1644,1418,1418,1134])
         self.assertEqual(doc.styles["Normal"].font.name, "Times New Roman")
+        self.assertEqual(doc.styles["Normal"].font.size.pt, 14)
         self.assertEqual(doc.styles["Normal"].element.xpath(".//w:rFonts/@w:eastAsia"), ["宋体"])
         self.assertEqual(doc.styles["Heading 1"].element.xpath(".//w:rFonts/@w:eastAsia"), ["黑体"])
         self.assertTrue(references <= anchors)
@@ -147,12 +188,106 @@ class ModuleReportTests(unittest.TestCase):
         self.assertTrue({"../logs/case.vcd", "../logs/key%20case.png", "../docs/verification-details_v0p5.csv", "../plan.json", "../results.json"} <= links)
         self.assertIn("CANDIDATE", result.stdout)
         headings = [p.text for p in doc.paragraphs if p.style.name == "Heading 1"]
-        for heading in ("验证策略", "验证方案", "验证结果"):
-            self.assertTrue(any(text.endswith(heading) for text in headings))
+        self.assertEqual(headings, ["验证策略", "验证方案", "验证结果"])
         self.assertEqual(len(doc.inline_shapes), 1)
-        self.assertTrue(any("CP-B" in p.text and "20–30 ns" in p.text for p in doc.paragraphs))
+        self.assertTrue(any("CP-B" in p.text and "20–30 ns" in p.text and "/tb_router/dut/ready" in p.text
+                            for p in doc.paragraphs))
         with zipfile.ZipFile(self.root / name) as package:
             self.assertTrue(any(package.read(member) == PNG for member in package.namelist() if member.startswith("word/media/")))
+            for member in package.namelist():
+                if member.endswith(".xml"):
+                    self.assertNotIn(b"{{", package.read(member), member)
+            self.assertNotIn("说明模块用途".encode(), package.read("word/document.xml"))
+
+    @unittest.skipUnless(importlib.util.find_spec("docx"), "optional Word dependency")
+    def test_archived_paragraph_cover_retains_empty_control_numbers(self):
+        from docx import Document
+        from verify_layout import read_cover
+        doc = Document()
+        doc.add_paragraph(self.plan["project"])
+        for label, value in (("文件名称", "路由器模块验证文档"), ("文件编号", ""), ("文件版本号", "v0p5"),
+                             ("项目任务号", ""), ("编制日期", "2025-08-15")):
+            doc.add_paragraph(label + "\t" + value)
+        doc.add_section()
+        # Body fields must never supply missing identity on the cover.
+        doc.add_paragraph("文件版本号\tv1p0")
+        fields, project = read_cover(doc)
+        self.assertIsNone(project)
+        self.assertEqual(fields["文件版本号"], "v0p5")
+        self.assertEqual(fields["文件编号"], "")
+        self.assertEqual(fields["项目任务号"], "")
+
+    @unittest.skipUnless(importlib.util.find_spec("docx"), "optional Word dependency")
+    def test_controlled_document_title_is_independent_of_frozen_module_name(self):
+        from docx import Document
+        from verify_layout import check_table_cover, read_cover
+        name = "release/formal_v0p5.docx"
+        title = "接口验收验证文档"
+        result = self.export(name, "--title", title)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        doc = Document(self.root / name)
+        fields, project = read_cover(doc)
+        self.assertEqual(fields["文件名称"], title)
+        self.assertEqual(doc.core_properties.title, title)
+        self.assertEqual(doc.core_properties.subject, "路由器")
+        printed = "\n".join([project, *fields, *fields.values()])
+        self.assertEqual(check_table_cover(doc, fields, project, printed), "路由器")
+        doc.core_properties.title = "另一书名"
+        with self.assertRaisesRegex(ValueError, "title differs"):
+            check_table_cover(doc, fields, project, printed)
+        doc.core_properties.title = title
+        doc.core_properties.subject = "另一模块"
+        with self.assertRaisesRegex(ValueError, "header"):
+            check_table_cover(doc, fields, project, printed)
+        result = self.export(name, "--title", "  ")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(Document(self.root / name).core_properties.title, title)
+
+    @unittest.skipUnless(importlib.util.find_spec("docx"), "optional Word dependency")
+    def test_default_title_and_archived_table_metadata(self):
+        from docx import Document
+        from verify_layout import check_table_cover, read_cover
+        name = "release/default_v0p5.docx"
+        self.assertEqual(self.export(name).returncode, 0)
+        doc = Document(self.root / name)
+        fields, project = read_cover(doc)
+        self.assertEqual(fields["文件名称"], "路由器模块验证文档")
+        self.assertEqual(doc.core_properties.title, fields["文件名称"])
+        # Earlier table-cover releases stored the project/version as dc:title.
+        doc.core_properties.title = project + " 验证报告 v0p5"
+        printed = "\n".join([project, *fields, *fields.values()])
+        self.assertEqual(check_table_cover(doc, fields, project, printed), "路由器")
+        fields["文件名称"] = "未登记的文件名称"
+        with self.assertRaisesRegex(ValueError, "title differs"):
+            check_table_cover(doc, fields, project, printed)
+
+    @unittest.skipUnless(importlib.util.find_spec("docx"), "optional Word dependency")
+    def test_missing_or_invalid_bundled_template_preserves_existing_artifacts(self):
+        from docx import Document
+        from docx.oxml.ns import qn
+        from formal_word import MODULE_TEMPLATE
+        from render_report import main
+        self.export("seed_v0p5.md")
+        output = self.root / "release_v0p5.docx"
+        details = output.with_name("release-details_v0p5.csv")
+        output.write_bytes(b"reviewer's Word")
+        details.write_bytes(b"reviewer's CSV")
+        template = self.root / "template.docx"
+        options = ["--root", str(self.root), "--plan", "plan.json", "--results", "results.json", "--output", str(output)]
+        with patch("formal_word.MODULE_TEMPLATE", template):
+            for invalid in ("missing", "broken package", "empty document", "wrong cell merge"):
+                if invalid == "broken package":
+                    template.write_bytes(b"invalid Word package")
+                if invalid == "empty document":
+                    Document().save(template)
+                if invalid == "wrong cell merge":
+                    doc = Document(MODULE_TEMPLATE)
+                    doc.tables[0]._tbl.xpath("./w:tr[5]//w:gridSpan")[0].set(qn("w:val"), "3")
+                    doc.save(template)
+                with self.subTest(invalid=invalid):
+                    self.assertEqual(main(options), 1)
+                    self.assertEqual(output.read_bytes(), b"reviewer's Word")
+                    self.assertEqual(details.read_bytes(), b"reviewer's CSV")
 
 
     def test_module_version_forms_and_details_are_strict(self):
@@ -180,11 +315,39 @@ class ModuleReportTests(unittest.TestCase):
                 self.assertFalse(existing.with_suffix(".pdf").exists())
 
     @unittest.skipUnless(os.environ.get("SUPERVERIFY_SOFFICE"), "provide the project LibreOffice for PDF integration")
+    def test_archived_paragraph_cover_with_original_body_font_still_renders(self):
+        from docx import Document
+        from docx.shared import Pt
+        from verify_layout import main, render_and_check
+        name = "release/archived_v0p5.docx"
+        result = self.export(name)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        dest = self.root / name
+        doc = Document(dest)
+        table = doc.tables[0]._tbl
+        for line in (self.plan["project"], "路由器模块验证文档", "文件名称\t路由器模块验证文档", "文件编号\t",
+                     "文件版本号\tv0p5", "项目任务号\t", "编制日期\t2025-08-15"):
+            table.addprevious(doc.add_paragraph(line)._p)
+        table.getparent().remove(table)
+        doc.styles["Normal"].font.size = Pt(11)
+        # Paragraph-cover archives predate native TOC wrappers. They still
+        # contain the individual bookmarked page references.
+        for run in doc.element.xpath(".//w:r[w:fldChar or w:instrText]"):
+            run.getparent().remove(run)
+        candidate = io.BytesIO()
+        doc.save(candidate)
+        word, pdf = render_and_check(candidate.getvalue(), dest.parent, os.environ["SUPERVERIFY_SOFFICE"],
+                                     dest.with_name("archived-details_v0p5.csv"))
+        dest.write_bytes(word)
+        dest.with_suffix(".pdf").write_bytes(pdf)
+        self.assertEqual(main([str(dest)]), 0)
+
+    @unittest.skipUnless(os.environ.get("SUPERVERIFY_SOFFICE"), "provide the project LibreOffice for PDF integration")
     def test_rendered_word_pdf_page_cache_and_evidence_failures(self):
         from docx import Document
         from docx.oxml.ns import qn
         name = "release/review_v0p5.docx"
-        result = self.export(name, "--soffice", os.environ["SUPERVERIFY_SOFFICE"], "--pdf")
+        result = self.export(name, "--title", "受控接口验证文件", "--soffice", os.environ["SUPERVERIFY_SOFFICE"], "--pdf")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("RENDERED", result.stdout)
         dest = self.root / name
@@ -194,21 +357,81 @@ class ModuleReportTests(unittest.TestCase):
             self.assertEqual(run.returncode, expected, run.stderr)
             self.assertIn(message, run.stderr)
             if expected == 0:
-                self.assertGreaterEqual(json.loads(run.stdout)["front_pages"], 2)
+                self.assertGreaterEqual(json.loads(run.stdout)["front_pages"], 3)
         verify(0)
+        from xml.etree import ElementTree
+        converted = subprocess.run([os.environ["SUPERVERIFY_SOFFICE"],
+                                    "-env:UserInstallation=" + (self.root/"index-profile").as_uri(),
+                                    "--headless", "--convert-to", "fodt", "--outdir", str(dest.parent), str(dest)],
+                                   capture_output=True, text=True, timeout=90)
+        self.assertEqual(converted.returncode, 0, converted.stderr)
+        odf = ElementTree.parse(dest.with_suffix(".fodt"))
+        text_ns = "{urn:oasis:names:tc:opendocument:xmlns:text:1.0}"
+        indexes = [e for e in odf.iter() if e.tag in {text_ns + k for k in
+                   ("table-of-content", "table-index", "illustration-index")}]
+        self.assertEqual(len(indexes), 3)
+        self.assertEqual(indexes[0].tag, text_ns + "table-of-content")
+        self.assertEqual([e[0].get(text_ns + "caption-sequence-name") for e in indexes[1:]], ["表", "图"])
+        self.assertTrue(all(e.findall(text_ns + "index-body/" + text_ns + "p") for e in indexes))
         latest = self.root / "latest"
         latest.mkdir()
-        for source in (dest, dest.with_suffix(".pdf")):
-            (latest/source.name).symlink_to(Path("..")/source.parent.name/source.name)
-        alias = subprocess.run([*check[:-1], str(latest/dest.name)], capture_output=True, text=True)
-        self.assertEqual(alias.returncode, 0, alias.stderr)
+        word_link = latest / "review.docx"
+        word_link.symlink_to(Path("..") / name)
+        pdf_link = word_link.with_suffix(".pdf")
+
+        def verify_latest(expected):
+            alias = subprocess.run([*check[:-1], str(word_link)], capture_output=True, text=True)
+            self.assertEqual(alias.returncode, expected, alias.stderr)
+
+        verify_latest(0)
+        pdf_link.symlink_to("missing.pdf")
+        verify_latest(1)
+        pdf_link.unlink()
+        pdf_link.symlink_to(Path("..") / Path(name).with_suffix(".pdf"))
+        verify_latest(0)
         original = dest.read_bytes()
         doc = Document(dest)
-        cover = next(p for p in doc.paragraphs if p.text == "文件版本号\tv0p5")
-        cover.text = "文件版本号\tV0.5"
+        for code in doc.element.xpath(".//w:r[w:fldChar or w:instrText]"):
+            code.getparent().remove(code)
+        doc.save(dest)
+        verify(1, "outside the native Word index")
+        dest.write_bytes(original)
+        doc = Document(dest)
+        doc.element.xpath(".//w:instrText")[1].text = r' TOC \h \z \c "图" '
+        doc.save(dest)
+        verify(1, "native Word index instruction")
+        dest.write_bytes(original)
+        doc = Document(dest)
+        # Change the real rendered sequence while leaving the cached index
+        # intact. Checking only index page numbers cannot catch this defect.
+        from verify_layout import render_and_check
+        caption = next(p for p in doc.paragraphs if p.style.name == "Caption"
+                       and "".join(p._p.xpath(".//w:t/text()")).startswith("表 3-1　验证结果"))
+        caption._p.xpath("./w:fldSimple")[1].set(qn("w:instr"), r"SEQ 表 \r 8")
+        damaged = io.BytesIO()
+        doc.save(damaged)
+        with self.assertRaisesRegex(ValueError, "indexed heading or caption"):
+            render_and_check(damaged.getvalue(), dest.parent, os.environ["SUPERVERIFY_SOFFICE"],
+                             dest.with_name("review-details_v0p5.csv"))
+        doc = Document(dest)
+        version_value = doc.tables[0]._tbl.xpath("./w:tr[5]//w:t[last()]")[-1]
+        version_value.text = "V0.5"
         doc.save(dest)
         verify(1, "visible cover")
         dest.write_bytes(original)
+        doc = Document(dest)
+        from docx.shared import Pt
+        doc.styles["Normal"].font.size = Pt(11)
+        doc.save(dest)
+        verify(1, "14 pt")
+        dest.write_bytes(original)
+        plan_file = self.root / "plan.json"
+        old_plan = plan_file.read_bytes()
+        for mismatched in (dict(self.plan, project="另一项目"),
+                           dict(self.plan, module_report=dict(self.plan["module_report"], module="另一模块"))):
+            plan_file.write_text(json.dumps(mismatched))
+            verify(1, "linked plan project or module")
+        plan_file.write_bytes(old_plan)
         doc = Document(dest)
         first_ref = doc.element.xpath(".//w:fldSimple")[0]
         next(first_ref.iter(qn("w:t"))).text = "999"
